@@ -339,14 +339,16 @@ def analyze_stock(code, stock_name, symbol, analysis_date_str, params):
 # 🔥 關鍵新增：全展開表格顯示函式
 def display_full_table(df):
     """
-    動態計算表格高度以顯示所有行
-    Row height ~35px + Header ~38px + buffer
+    動態計算表格高度以顯示所有行 (取消內部捲動)
+    因應 CSS 字體放大 (1.1rem)，調整行高計算參數
     """
     if df is not None and not df.empty:
-        # 計算高度 (每行 35px，標題 40px)
-        # 限制最大高度為 800px 以免過長，或者設為 None 讓他自然展開
-        # 為了 "全部列出"，我們用計算值
-        height = (len(df) + 1) * 35 + 3
+        # 由於您的 CSS 將字體設為 1.1rem，原先的 35px 高度估算會太小導致捲軸出現
+        # 這裡將每行高度估算加大至 45px
+        # 總高度 = (資料行數 + 1 標題列) * 45px + 緩衝像素
+        row_height = 45 
+        height = (len(df) + 1) * row_height + 10
+        
         st.dataframe(
             df, 
             hide_index=True, 
