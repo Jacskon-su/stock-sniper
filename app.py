@@ -190,7 +190,6 @@ def fetch_history_data(symbol, start_date=None, end_date=None, period="2y"):
 def get_stock_data_with_realtime(code, symbol, analysis_date_str, start_date=None, end_date=None):
     """
     取得資料並補即時盤
-    🔥 優化：直接接收 symbol，不再猜測 .TW/.TWO
     """
     # 若有指定日期範圍，使用日期範圍下載
     if start_date:
@@ -222,9 +221,9 @@ def get_stock_data_with_realtime(code, symbol, analysis_date_str, start_date=Non
 def analyze_stock(code, stock_name, symbol, analysis_date_str, params):
     """多執行緒分析核心"""
     try:
-        # 🔥 優化：減少延遲時間以加快速度，但保留微小隨機避免完全同步
-        time.sleep(random.uniform(0.01, 0.05))
+        # 🔥 優化：移除原本的人為延遲 time.sleep(random...) 以加快速度
         
+        # 取得數據
         df = get_stock_data_with_realtime(code, symbol, analysis_date_str)
         if df is None or len(df) < 250: return None
         
@@ -336,16 +335,13 @@ def analyze_stock(code, stock_name, symbol, analysis_date_str, params):
     except: return None
     return None
 
-# 🔥 關鍵新增：全展開表格顯示函式
+# 🔥 全展開表格顯示函式 (維持不捲動設定)
 def display_full_table(df):
     """
     動態計算表格高度以顯示所有行 (取消內部捲動)
-    因應 CSS 字體放大 (1.1rem)，調整行高計算參數
     """
     if df is not None and not df.empty:
-        # 由於您的 CSS 將字體設為 1.1rem，原先的 35px 高度估算會太小導致捲軸出現
-        # 這裡將每行高度估算加大至 45px
-        # 總高度 = (資料行數 + 1 標題列) * 45px + 緩衝像素
+        # 行高 45px 避免文字被切到
         row_height = 45 
         height = (len(df) + 1) * row_height + 10
         
@@ -366,13 +362,18 @@ st.sidebar.header("🛡️ 狙擊手策略參數")
 analysis_date_input = st.sidebar.date_input("分析基準日", datetime.date.today())
 analysis_date_str = analysis_date_input.strftime('%Y-%m-%d')
 
-with st.sidebar.expander("進階參數設定", expanded=False):
+with st.sidebar.expander("進階參數設定", expanded=True): 
     ma_trend = st.number_input("趨勢線 (MA)", value=60)
     use_year = st.checkbox("啟用年線 (240MA) 濾網", value=True)
     big_candle = st.slider("長紅漲幅門檻 (%)", 2.0, 10.0, 3.0, 0.5) / 100
     min_vol = st.number_input("最小成交量 (張)", value=1000) * 1000
 
-params = {'ma_trend': ma_trend, 'use_year': use_year, 'big_candle': big_candle, 'min_vol': min_vol}
+params = {
+    'ma_trend': ma_trend, 
+    'use_year': use_year, 
+    'big_candle': big_candle, 
+    'min_vol': min_vol
+}
 
 tab1, tab2 = st.tabs(["🚀 全台股掃描", "📊 個股 K 線診斷"])
 
@@ -385,7 +386,7 @@ with tab1:
         st.info(f"📅 基準日: **{analysis_date_str}**")
 
     if st.button("開始掃描", type="primary"):
-        # 🔥 修正：使用正確的函式名稱 get_stock_info_map
+        # 取得股票列表
         stock_info_map = get_stock_info_map()
         
         if scan_scope.startswith("🔥"):
@@ -400,12 +401,15 @@ with tab1:
         
         status = st.empty()
         prog = st.progress(0)
-        status.text("🚀 啟動多執行緒引擎 (Max: 20)...")
+        # 🔥 優化：將執行緒數量提升至 50
+        max_workers = 50 if len(scan_codes) > 100 else 20
+        status.text(f"🚀 啟動多執行緒引擎 (Max: {max_workers})...")
         
         total = len(scan_codes)
         done = 0
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        # 使用 ThreadPoolExecutor
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for code in scan_codes:
                 if code in stock_info_map:
@@ -414,7 +418,7 @@ with tab1:
             
             for future in concurrent.futures.as_completed(futures):
                 done += 1
-                if done % 10 == 0:
+                if done % 10 == 0 or done == total:
                     prog.progress(done / total)
                     status.text(f"掃描進度: {done}/{total}...")
                 
@@ -500,6 +504,7 @@ with tab2:
         try:
             # 取得正確 Symbol
             symbol_try = f"{stock_input}.TW"
+            # 對於診斷功能，我們通常希望精確，所以這裡不強制開啟極速模式，或者預設關閉
             df = get_stock_data_with_realtime(stock_input, symbol_try, analysis_date_str)
             if df is None or df.empty:
                 symbol_try = f"{stock_input}.TWO"
@@ -507,7 +512,6 @@ with tab2:
 
             start_str = start_date.strftime('%Y-%m-%d')
             end_str = end_date.strftime('%Y-%m-%d')
-            download_start = (start_date - datetime.timedelta(days=400)).strftime('%Y-%m-%d')
             
             if df is not None:
                 SniperStrategy.ma_trend_period = ma_trend
