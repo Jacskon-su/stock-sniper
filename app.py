@@ -144,42 +144,66 @@ def get_detailed_sector(code):
     return "其他"
 
 @st.cache_data(ttl=3600)
-def get_stock_list():
+def get_stock_info_map():
+    """
+    取得上市櫃股票資訊表
+    回傳字典: {code: {'name': name, 'symbol': full_symbol}}
+    🔥 優化：直接區分 .TW 與 .TWO，避免下載時嘗試錯誤
+    """
     try:
-        twse = {code: f"{code} {info.name}" for code, info in twstock.twse.items() if len(code) == 4}
-        tpex = {code: f"{code} {info.name}" for code, info in twstock.tpex.items() if len(code) == 4}
-        return {**twse, **tpex}
+        stock_map = {}
+        # 上市 (.TW)
+        for code, info in twstock.twse.items():
+            if len(code) == 4:
+                stock_map[code] = {'name': f"{code} {info.name}", 'symbol': f"{code}.TW"}
+        # 上櫃 (.TWO)
+        for code, info in twstock.tpex.items():
+            if len(code) == 4:
+                stock_map[code] = {'name': f"{code} {info.name}", 'symbol': f"{code}.TWO"}
+        return stock_map
     except:
         return {}
 
 def fetch_history_data(symbol, start_date=None, end_date=None, period="2y"):
+    """
+    下載數據 (使用 yf.Ticker 增強多執行緒隔離性)
+    支援指定日期範圍
+    """
     try:
         ticker = yf.Ticker(symbol)
+        # 如果有指定日期範圍，優先使用
         if start_date and end_date:
             df = ticker.history(start=start_date, end=end_date)
         else:
             df = ticker.history(period=period)
+        
         if df.empty: return None
-        if df.index.tz is not None: df.index = df.index.tz_localize(None)
+        
+        # 移除時區資訊，避免後續運算報錯
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+            
         return df
     except:
         return None
 
-def get_stock_data_with_realtime(code, analysis_date_str, start_date=None, end_date=None):
-    symbol = f"{code}.TW"
-    if start_date: df = fetch_history_data(symbol, start_date=start_date, end_date=end_date)
-    else: df = fetch_history_data(symbol)
+def get_stock_data_with_realtime(code, symbol, analysis_date_str, start_date=None, end_date=None):
+    """
+    取得資料並補即時盤
+    🔥 優化：直接接收 symbol，不再猜測 .TW/.TWO
+    """
+    # 若有指定日期範圍，使用日期範圍下載
+    if start_date:
+        df = fetch_history_data(symbol, start_date=start_date, end_date=end_date)
+    else:
+        df = fetch_history_data(symbol)
         
-    if df is None or df.empty:
-        symbol = f"{code}.TWO"
-        if start_date: df = fetch_history_data(symbol, start_date=start_date, end_date=end_date)
-        else: df = fetch_history_data(symbol)
-    
     if df is None or df.empty: return None
     
     last_dt = df.index[-1].strftime('%Y-%m-%d')
     today_str = datetime.datetime.now().strftime('%Y-%m-%d')
     
+    # 檢查是否需要補即時盤 (僅當分析日為今日且尚未有資料時)
     if analysis_date_str == today_str and last_dt != today_str:
         try:
             realtime = twstock.realtime.get(code)
@@ -191,16 +215,20 @@ def get_stock_data_with_realtime(code, analysis_date_str, start_date=None, end_d
                     'Volume': float(rt['accumulate_trade_volume']) * 1000
                 }, name=pd.Timestamp(today_str))
                 df = pd.concat([df, new_row.to_frame().T])
-        except: pass
+        except:
+            pass
     return df
 
-def analyze_stock(code, stock_name, analysis_date_str, params):
+def analyze_stock(code, stock_name, symbol, analysis_date_str, params):
+    """多執行緒分析核心"""
     try:
-        time.sleep(random.uniform(0.05, 0.2))
+        # 🔥 優化：減少延遲時間以加快速度，但保留微小隨機避免完全同步
+        time.sleep(random.uniform(0.01, 0.05))
         
-        df = get_stock_data_with_realtime(code, analysis_date_str)
+        df = get_stock_data_with_realtime(code, symbol, analysis_date_str)
         if df is None or len(df) < 250: return None
         
+        # 解包參數
         ma_trend = params['ma_trend']
         use_year = params['use_year']
         big_candle = params['big_candle']
@@ -212,34 +240,45 @@ def analyze_stock(code, stock_name, analysis_date_str, params):
         volume = df['Volume']
         op = df['Open']
         
+        # 指標計算
         ma_t = close.rolling(window=ma_trend).mean()
         ma_y = close.rolling(window=240).mean()
         vol_ma = volume.rolling(window=5).mean()
         
+        # 定位日期
         df['DateStr'] = df.index.strftime('%Y-%m-%d')
         if analysis_date_str not in df['DateStr'].values: return None
         idx = df.index.get_loc(pd.Timestamp(analysis_date_str))
         
+        # 基礎濾網
         if volume.iloc[idx] < min_vol: return None
         if use_year and close.iloc[idx] < ma_y.iloc[idx]: return None
         if not (close.iloc[idx] > ma_t.iloc[idx] and ma_t.iloc[idx] > ma_t.iloc[idx-1]): return None
         
+        # 今日 Setup?
         is_setup = (
             (close.iloc[idx] - close.iloc[idx-1]) / close.iloc[idx-1] > big_candle and
             volume.iloc[idx] > vol_ma.iloc[idx] and
             close.iloc[idx] > op.iloc[idx]
         )
         
-        setup_found, s_low, s_high, s_date, setup_idx = False, 0, 0, "", -1
+        # 回溯尋找 Setup
+        setup_found = False
+        s_low = 0
+        s_high = 0 # 長紅高點
+        s_date = ""
+        setup_idx = -1
         
         for k in range(1, 11):
             b_idx = idx - k
             if b_idx < 0: break
             
+            # Setup 條件
             if ((close.iloc[b_idx] - close.iloc[b_idx-1]) / close.iloc[b_idx-1] > big_candle and
                 volume.iloc[b_idx] > vol_ma.iloc[b_idx] and
                 close.iloc[b_idx] > op.iloc[b_idx]):
                 
+                # 破底檢查
                 broken = False
                 for m in range(b_idx+1, idx+1):
                     if close.iloc[m] < low.iloc[b_idx]:
@@ -257,6 +296,7 @@ def analyze_stock(code, stock_name, analysis_date_str, params):
         if setup_found:
             yest_high = high.iloc[idx-1]
             if close.iloc[idx] > yest_high:
+                # 強勢續漲 vs N字突破
                 is_strong = False
                 if idx == setup_idx + 1: is_strong = True
                 else:
@@ -266,11 +306,17 @@ def analyze_stock(code, stock_name, analysis_date_str, params):
                 tag = "🚀 強勢續漲" if is_strong else "🎯 N字突破"
                 return ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_close:.2f}", "狀態": tag, "訊號日": s_date, "突破價": f"{yest_high:.2f}"})
             else:
+                # Watching 分類邏輯
                 prev_c_today = close.iloc[idx-1]
                 curr_pct = (c_close - prev_c_today) / prev_c_today
+                
                 status_watch = "👀 整理中"
-                if c_close >= s_high and abs(curr_pct) < 0.03: status_watch = "💪 強勢整理"
-                elif c_close < s_high and c_close >= s_low: status_watch = "📉 回檔整理"
+                # 強勢整理: 股價在長紅K上方整理 漲跌幅<3% 且收盤不跌破長紅K高點
+                if c_close >= s_high and abs(curr_pct) < 0.03:
+                    status_watch = "💪 強勢整理"
+                # 回檔整理: 股價在實體長紅K內 (小於高點) 且未跌破長紅K低點
+                elif c_close < s_high and c_close >= s_low:
+                    status_watch = "📉 回檔整理"
 
                 return ("watching", {
                     "代號": code, "名稱": stock_name, "收盤": f"{c_close:.2f}", 
@@ -278,6 +324,7 @@ def analyze_stock(code, stock_name, analysis_date_str, params):
                     "長紅高": f"{s_high:.2f}", "漲跌幅": f"{curr_pct*100:.2f}%"
                 })
         elif is_setup:
+            # 計算漲幅
             prev_c = close.iloc[idx-1]
             pct_chg = (c_close - prev_c) / prev_c * 100
             stock_group = get_detailed_sector(code)
@@ -336,26 +383,32 @@ with tab1:
         st.info(f"📅 基準日: **{analysis_date_str}**")
 
     if st.button("開始掃描", type="primary"):
-        stock_dict = get_stock_list()
+        # 🔥 修正：使用正確的函式名稱 get_stock_info_map
+        stock_info_map = get_stock_info_map()
+        
         if scan_scope.startswith("🔥"):
-            scan_list = ['2330', '2317', '2454', '2603', '1519', '3231', '2382', '3037', '2368', '3035', 
+            scan_codes = ['2330', '2317', '2454', '2603', '1519', '3231', '2382', '3037', '2368', '3035', 
                          '3017', '3324', '1513', '6213', '8069', '3661', '6669', '9958', '6415', '6531',
                          '3532', '2376', '3529', '3443', '2609', '2615', '2002', '2881', '2882', '8038',
                          '2356', '2357', '4938', '4906', '5347', '6274', '2313', '2401', '2449', '3034']
         else:
-            scan_list = list(stock_dict.keys())
+            scan_codes = list(stock_info_map.keys())
 
         triggered, new_setup, watching = [], [], []
         
         status = st.empty()
         prog = st.progress(0)
-        status.text("🚀 啟動多執行緒引擎...")
+        status.text("🚀 啟動多執行緒引擎 (Max: 20)...")
         
-        total = len(scan_list)
+        total = len(scan_codes)
         done = 0
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(analyze_stock, code, stock_dict.get(code,code), analysis_date_str, params): code for code in scan_list}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {}
+            for code in scan_codes:
+                if code in stock_info_map:
+                    info = stock_info_map[code]
+                    futures[executor.submit(analyze_stock, code, info['name'], info['symbol'], analysis_date_str, params)] = code
             
             for future in concurrent.futures.as_completed(futures):
                 done += 1
@@ -373,7 +426,7 @@ with tab1:
         prog.progress(1.0)
         status.success(f"掃描完成！")
         
-        # 分類處理 Triggered 名單
+        # 分類處理 Triggered 名單 (強勢續漲 vs N字突破)
         trigger_strong = [x for x in triggered if "強勢續漲" in x['狀態']]
         trigger_n = [x for x in triggered if "N字突破" in x['狀態']]
         
@@ -401,6 +454,7 @@ with tab1:
         st.caption("符合條件：季線之上第一根爆量實體長紅")
         if new_setup:
             df_new = pd.DataFrame(new_setup)
+            # 統計族群分佈
             if "族群" in df_new.columns:
                 sector_counts = df_new['族群'].value_counts().reset_index()
                 sector_counts.columns = ['族群', '數量']
@@ -442,11 +496,16 @@ with tab2:
     
     if col_b.button("診斷"):
         try:
+            # 取得正確 Symbol
+            symbol_try = f"{stock_input}.TW"
+            df = get_stock_data_with_realtime(stock_input, symbol_try, analysis_date_str)
+            if df is None or df.empty:
+                symbol_try = f"{stock_input}.TWO"
+                df = get_stock_data_with_realtime(stock_input, symbol_try, analysis_date_str)
+
             start_str = start_date.strftime('%Y-%m-%d')
             end_str = end_date.strftime('%Y-%m-%d')
             download_start = (start_date - datetime.timedelta(days=400)).strftime('%Y-%m-%d')
-            
-            df = get_stock_data_with_realtime(stock_input, analysis_date_str, start_date=download_start, end_date=end_str)
             
             if df is not None:
                 SniperStrategy.ma_trend_period = ma_trend
