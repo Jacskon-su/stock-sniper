@@ -164,6 +164,8 @@ def get_stock_info_map():
     except:
         return {}
 
+# 🔥 優化：加入快取機制，ttl=1800 (30分鐘)
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_history_data(symbol, start_date=None, end_date=None, period="2y"):
     """
     下載數據 (使用 yf.Ticker 增強多執行緒隔離性)
@@ -221,7 +223,7 @@ def get_stock_data_with_realtime(code, symbol, analysis_date_str, start_date=Non
 def analyze_stock(code, stock_name, symbol, analysis_date_str, params):
     """多執行緒分析核心"""
     try:
-        # 🔥 優化：移除原本的人為延遲 time.sleep(random...) 以加快速度
+        # 🔥 優化：移除人為延遲
         
         # 取得數據
         df = get_stock_data_with_realtime(code, symbol, analysis_date_str)
@@ -254,74 +256,96 @@ def analyze_stock(code, stock_name, symbol, analysis_date_str, params):
         if use_year and close.iloc[idx] < ma_y.iloc[idx]: return None
         if not (close.iloc[idx] > ma_t.iloc[idx] and ma_t.iloc[idx] > ma_t.iloc[idx-1]): return None
         
-        # 今日 Setup?
+        # 今日是否為 Setup K棒 (長紅)
         is_setup = (
             (close.iloc[idx] - close.iloc[idx-1]) / close.iloc[idx-1] > big_candle and
             volume.iloc[idx] > vol_ma.iloc[idx] and
             close.iloc[idx] > op.iloc[idx]
         )
         
-        # 回溯尋找 Setup
+        # 往回尋找最近一次的 Setup K棒
         setup_found = False
         s_low = 0
         s_high = 0 # 長紅高點
         s_date = ""
         setup_idx = -1
         
-        for k in range(1, 11):
+        for k in range(1, 11): # 回溯 10 天
             b_idx = idx - k
             if b_idx < 0: break
             
-            # Setup 條件
+            # Setup 條件：實體長紅、爆量
             if ((close.iloc[b_idx] - close.iloc[b_idx-1]) / close.iloc[b_idx-1] > big_candle and
                 volume.iloc[b_idx] > vol_ma.iloc[b_idx] and
                 close.iloc[b_idx] > op.iloc[b_idx]):
                 
-                # 破底檢查
-                broken = False
-                for m in range(b_idx+1, idx+1):
-                    if close.iloc[m] < low.iloc[b_idx]:
-                        broken = True
-                        break
-                if not broken:
-                    setup_found = True
-                    setup_idx = b_idx
-                    s_low = low.iloc[b_idx]
-                    s_high = high.iloc[b_idx]
-                    s_date = df.index[b_idx].strftime('%Y-%m-%d')
-                    break
+                # Setup 找到，記錄資訊
+                setup_found = True
+                setup_idx = b_idx
+                s_low = low.iloc[b_idx]
+                s_high = high.iloc[b_idx]
+                s_date = df.index[b_idx].strftime('%Y-%m-%d')
+                break # 找到最近的一根就停止
         
         c_close = close.iloc[idx]
+        
+        # 如果前面有 Setup K棒，判斷現在的型態
         if setup_found:
-            yest_high = high.iloc[idx-1]
-            if close.iloc[idx] > yest_high:
-                # 強勢續漲 vs N字突破
-                is_strong = False
-                if idx == setup_idx + 1: is_strong = True
+            
+            # --- 判斷邏輯 1: 強勢續漲 ---
+            is_strong = True
+            
+            # 檢查範圍：從 setup_idx + 1 到 idx (含今日)
+            for k in range(setup_idx + 1, idx + 1):
+                # 如果是 setup 後第一天，要站上 setup 的高點
+                if k == setup_idx + 1:
+                    criteria_price = s_high
                 else:
-                    intermediate_lows = low.iloc[setup_idx+1 : idx]
-                    if (intermediate_lows > s_high).all(): is_strong = True
+                    # 否則要站上前一天的高點
+                    criteria_price = high.iloc[k-1]
                 
-                tag = "🚀 強勢續漲" if is_strong else "🎯 N字突破"
-                return ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_close:.2f}", "狀態": tag, "訊號日": s_date, "突破價": f"{yest_high:.2f}"})
-            else:
-                # Watching 分類邏輯
-                prev_c_today = close.iloc[idx-1]
-                curr_pct = (c_close - prev_c_today) / prev_c_today
-                
-                status_watch = "👀 整理中"
-                # 強勢整理: 股價在長紅K上方整理 漲跌幅<3% 且收盤不跌破長紅K高點
-                if c_close >= s_high and abs(curr_pct) < 0.03:
-                    status_watch = "💪 強勢整理"
-                # 回檔整理: 股價在實體長紅K內 (小於高點) 且未跌破長紅K低點
-                elif c_close < s_high and c_close >= s_low:
-                    status_watch = "📉 回檔整理"
+                if close.iloc[k] <= criteria_price:
+                    is_strong = False
+                    break
+            
+            if is_strong:
+                return ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_close:.2f}", "狀態": "🚀 強勢續漲", "訊號日": s_date, "突破價": f"{high.iloc[idx-1]:.2f}"})
 
+            # --- 判斷邏輯 2: N字突破 ---
+            if idx > setup_idx + 1:
+                is_consolidation_valid = True
+                # 檢查中間的每一天 (不含今日)
+                for k in range(setup_idx + 1, idx):
+                    c_k = close.iloc[k]
+                    # 條件：收盤價低於訊號長紅K高點 (整理) 且 收盤價不跌破訊號紅K低點 (支撐)
+                    if c_k > s_high or c_k < s_low:
+                        is_consolidation_valid = False
+                        break
+                
+                if is_consolidation_valid:
+                    # 觸發條件：發生突破前一根K棒高點
+                    if close.iloc[idx] > high.iloc[idx-1]:
+                         return ("triggered", {"代號": code, "名稱": stock_name, "收盤": f"{c_close:.2f}", "狀態": "🎯 N字突破", "訊號日": s_date, "突破價": f"{high.iloc[idx-1]:.2f}"})
+
+            # --- Watching (觀察中) 邏輯 ---
+            prev_c_today = close.iloc[idx-1]
+            curr_pct = (c_close - prev_c_today) / prev_c_today
+            
+            status_watch = "👀 整理中"
+            # 強勢整理: 收盤價 >= 長紅高
+            if c_close >= s_high:
+                status_watch = "💪 強勢整理"
+            # 回檔整理: 收盤價 < 長紅高 但 >= 長紅低
+            elif c_close < s_high and c_close >= s_low:
+                status_watch = "📉 回檔整理"
+            
+            if c_close >= s_low:
                 return ("watching", {
                     "代號": code, "名稱": stock_name, "收盤": f"{c_close:.2f}", 
                     "狀態": status_watch, "訊號日": s_date, "防守": f"{s_low:.2f}", 
                     "長紅高": f"{s_high:.2f}", "漲跌幅": f"{curr_pct*100:.2f}%"
                 })
+
         elif is_setup:
             # 計算漲幅
             prev_c = close.iloc[idx-1]
@@ -335,16 +359,16 @@ def analyze_stock(code, stock_name, symbol, analysis_date_str, params):
     except: return None
     return None
 
-# 🔥 全展開表格顯示函式 (維持不捲動設定)
+# 🔥 全展開表格顯示函式
 def display_full_table(df):
     """
-    動態計算表格高度以顯示所有行 (取消內部捲動)
+    動態計算表格高度以顯示所有行
+    修正：高度計算更緊湊，移除多餘緩衝，解決表格底部空白問題
     """
     if df is not None and not df.empty:
-        # 行高 45px 避免文字被切到
-        row_height = 45 
-        height = (len(df) + 1) * row_height + 10
-        
+        # 計算高度: 標題約 38px + 每行 35px
+        # 將乘數從之前的寬鬆計算下修，確保底部切齊
+        height = (len(df) * 35) + 38
         st.dataframe(
             df, 
             hide_index=True, 
@@ -352,7 +376,7 @@ def display_full_table(df):
             height=height 
         )
     else:
-        st.info("無")
+        st.info("無") # 恢復顯示「無」，確保標題保留時有內容填充
 
 # ==========================================
 # 🖥️ 側邊欄與主畫面
@@ -367,6 +391,16 @@ with st.sidebar.expander("進階參數設定", expanded=True):
     use_year = st.checkbox("啟用年線 (240MA) 濾網", value=True)
     big_candle = st.slider("長紅漲幅門檻 (%)", 2.0, 10.0, 3.0, 0.5) / 100
     min_vol = st.number_input("最小成交量 (張)", value=1000) * 1000
+    
+    st.divider()
+    # 系統效能設定
+    st.caption("🔧 系統效能")
+    max_workers_input = st.slider(
+        "並行掃描執行緒數", 
+        min_value=1, 
+        max_value=32, 
+        value=8
+    )
 
 params = {
     'ma_trend': ma_trend, 
@@ -401,9 +435,10 @@ with tab1:
         
         status = st.empty()
         prog = st.progress(0)
-        # 🔥 優化：將執行緒數量提升至 50
-        max_workers = 50 if len(scan_codes) > 100 else 20
-        status.text(f"🚀 啟動多執行緒引擎 (Max: {max_workers})...")
+        
+        # 使用使用者設定的執行緒數量
+        max_workers = max_workers_input
+        status.text(f"🚀 啟動多執行緒引擎 (Threads: {max_workers})...")
         
         total = len(scan_codes)
         done = 0
@@ -440,24 +475,23 @@ with tab1:
         watch_strong = [d for d in watching if "強勢整理" in d['狀態']]
         watch_pullback = [d for d in watching if "回檔整理" in d['狀態']]
         
-        st.markdown("### 🎯 買點觸發訊號 (Actionable)")
-        col_t1, col_t2 = st.columns(2)
+        # --- 顯示區塊 (垂直排列，標題皆顯示) ---
         
-        with col_t1:
-            st.subheader(f"🚀 強勢續漲 ({len(trigger_strong)})")
-            display_full_table(pd.DataFrame(trigger_strong))
+        st.markdown("### 🎯 買點觸發訊號 (Actionable)")
+        
+        st.subheader(f"🚀 強勢續漲 ({len(trigger_strong)})")
+        display_full_table(pd.DataFrame(trigger_strong))
             
-        with col_t2:
-            st.subheader(f"🎯 N字突破 ({len(trigger_n)})")
-            display_full_table(pd.DataFrame(trigger_n))
-            
+        st.subheader(f"🎯 N字突破 ({len(trigger_n)})")
+        display_full_table(pd.DataFrame(trigger_n))
+        
         st.divider()
         
         st.markdown("### 👀 市場潛力名單 (Monitoring)")
         
-        # 剛起漲 (含族群統計)
         st.subheader(f"🔥 今日剛起漲 ({len(new_setup)})")
         st.caption("符合條件：季線之上第一根爆量實體長紅")
+        
         if new_setup:
             df_new = pd.DataFrame(new_setup)
             # 統計族群分佈
@@ -468,21 +502,18 @@ with tab1:
                 st.success("📊 熱門族群: " + " | ".join(top_sectors))
             display_full_table(df_new)
         else:
-            st.info("無")
+            # 若無資料，呼叫 display_full_table(empty) 會顯示 "無"
+            display_full_table(pd.DataFrame(new_setup))
         
         st.write("") 
 
-        # 觀察名單分類顯示
-        col_w1, col_w2 = st.columns(2)
-        with col_w1:
-            st.subheader(f"💪 強勢整理 ({len(watch_strong)})")
-            st.caption("股價守在長紅高點之上")
-            display_full_table(pd.DataFrame(watch_strong))
+        st.subheader(f"💪 強勢整理 ({len(watch_strong)})")
+        st.caption("股價守在長紅高點之上")
+        display_full_table(pd.DataFrame(watch_strong))
         
-        with col_w2:
-            st.subheader(f"📉 回檔整理 ({len(watch_pullback)})")
-            st.caption("股價回跌至長紅實體內 (未破底)")
-            display_full_table(pd.DataFrame(watch_pullback))
+        st.subheader(f"📉 回檔整理 ({len(watch_pullback)})")
+        st.caption("股價回跌至長紅實體內 (未破底)")
+        display_full_table(pd.DataFrame(watch_pullback))
 
 with tab2:
     st.header("📊 個股 K 線診斷 & 回測")
@@ -504,7 +535,6 @@ with tab2:
         try:
             # 取得正確 Symbol
             symbol_try = f"{stock_input}.TW"
-            # 對於診斷功能，我們通常希望精確，所以這裡不強制開啟極速模式，或者預設關閉
             df = get_stock_data_with_realtime(stock_input, symbol_try, analysis_date_str)
             if df is None or df.empty:
                 symbol_try = f"{stock_input}.TWO"
